@@ -1,1 +1,202 @@
+name: Build VCMI Switch with Touch Launcher
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-switch:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+
+    steps:
+      - name: 1. Install Nintendo Switch Libraries
+        run: |
+          dkp-pacman -Sy --noconfirm switch-dev switch-sdl2 switch-sdl2_ttf switch-freetype switch-libpng switch-bzip2 switch-zlib switch-harfbuzz switch-glad switch-mesa switch-libdrm_nouveau
+
+      - name: 2. Write Custom Switch Touchscreen Launcher
+        run: |
+          cat << 'EOF' > switch_launcher_main.cpp
+          #include <SDL2/SDL.h>
+          #include <SDL2/SDL_ttf.h>
+          #include <switch.h>
+          #include <fstream>
+          #include <vector>
+          #include <string>
+          #include <sys/stat.h>
+          #include <dirent.h>
+
+          void makeDir(const char* path) {
+              mkdir(path, 0777);
+          }
+
+          int main(int argc, char* argv[]) {
+              socketInitializeDefault();
+              romfsInit();
+              plInitialize(PlServiceType_User);
+
+              SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER);
+              TTF_Init();
+
+              SDL_Window* win = SDL_CreateWindow("VCMI Switch Launcher", 0, 0, 1280, 720, SDL_WINDOW_SHOWN);
+              SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+
+              PlFontData fontData;
+              TTF_Font* font = nullptr;
+              if (R_SUCCEEDED(plGetSharedFontByType(&fontData, PlSharedFontType_Standard))) {
+                  font = TTF_OpenFontRW(SDL_RWFromConstMem(fontData.address, fontData.size), 1, 28);
+              }
+
+              bool enableTouch = true;
+              bool radialWheel = true;
+              int uiScale = 120;
+
+              std::vector<std::pair<std::string, bool>> mods;
+              DIR* dir = opendir("sdmc:/switch/vcmi/Mods");
+              if (dir) {
+                  struct dirent* ent;
+                  while ((ent = readdir(dir)) != nullptr) {
+                      std::string name = ent->d_name;
+                      if (name != "." && name != "..") {
+                          mods.push_back(std::make_pair(name, true));
+                      }
+                  }
+                  closedir(dir);
+              }
+
+              SDL_Rect btnTouch = {80, 140, 500, 70};
+              SDL_Rect btnWheel = {80, 230, 500, 70};
+              SDL_Rect btnScale = {80, 320, 500, 70};
+              SDL_Rect btnPlay  = {80, 560, 1120, 100};
+
+              bool running = true;
+              while (running && appletMainLoop()) {
+                  SDL_Event e;
+                  while (SDL_PollEvent(&e)) {
+                      int tx = -1, ty = -1;
+                      if (e.type == SDL_FINGERDOWN) {
+                          tx = (int)(e.tfinger.x * 1280.0f);
+                          ty = (int)(e.tfinger.y * 720.0f);
+                      } else if (e.type == SDL_MOUSEBUTTONDOWN) {
+                          tx = e.button.x;
+                          ty = e.button.y;
+                      } else if (e.type == SDL_JOYBUTTONDOWN) {
+                          if (e.jbutton.button == 10 || e.jbutton.button == 0) {
+                              running = false;
+                          }
+                      }
+
+                      if (tx != -1 && ty != -1) {
+                          SDL_Point p = {tx, ty};
+                          if (SDL_PointInRect(&p, &btnTouch)) enableTouch = !enableTouch;
+                          if (SDL_PointInRect(&p, &btnWheel)) radialWheel = !radialWheel;
+                          if (SDL_PointInRect(&p, &btnScale)) {
+                              uiScale = (uiScale == 100) ? 120 : (uiScale == 120 ? 150 : 100);
+                          }
+                          if (SDL_PointInRect(&p, &btnPlay)) running = false;
+
+                          for (size_t i = 0; i < mods.size() && i < 5; ++i) {
+                              SDL_Rect mr = {680, (int)(140 + i * 75), 520, 65};
+                              if (SDL_PointInRect(&p, &mr)) mods[i].second = !mods[i].second;
+                          }
+                      }
+                  }
+
+                  SDL_SetRenderDrawColor(ren, 24, 26, 36, 255);
+                  SDL_RenderClear(ren);
+
+                  auto drawBox = [&](SDL_Rect r, const char* text, bool active, bool primary) {
+                      if (primary) SDL_SetRenderDrawColor(ren, 46, 139, 87, 255);
+                      else if (active) SDL_SetRenderDrawColor(ren, 65, 105, 225, 255);
+                      else SDL_SetRenderDrawColor(ren, 60, 60, 75, 255);
+                      SDL_RenderFillRect(ren, &r);
+                      SDL_SetRenderDrawColor(ren, 200, 200, 220, 255);
+                      SDL_RenderDrawRect(ren, &r);
+                      if (font) {
+                          SDL_Color col = {255, 255, 255, 255};
+                          SDL_Surface* surf = TTF_RenderUTF8_Blended(font, text, col);
+                          if (surf) {
+                              SDL_Texture* tex = SDL_CreateTextureFromSurface(ren, surf);
+                              SDL_Rect tr = {r.x + (r.w - surf->w)/2, r.y + (r.h - surf->h)/2, surf->w, surf->h};
+                              SDL_RenderCopy(ren, tex, nullptr, &tr);
+                              SDL_DestroyTexture(tex);
+                              SDL_FreeSurface(surf);
+                          }
+                      }
+                  };
+
+                  SDL_Rect hdr = {80, 30, 1120, 70};
+                  drawBox(hdr, "VCMI NINTENDO SWITCH TOUCH LAUNCHER", false, false);
+                  drawBox(btnTouch, enableTouch ? "Mobile Touch Controls: ON" : "Mobile Touch Controls: OFF", enableTouch, false);
+                  drawBox(btnWheel, radialWheel ? "Combat Radial Wheel: ON" : "Combat Radial Wheel: OFF", radialWheel, false);
+                  std::string scaleTxt = "Screen UI Scaling: " + std::to_string(uiScale) + "% (Tap to cycle)";
+                  drawBox(btnScale, scaleTxt.c_str(), true, false);
+
+                  for (size_t i = 0; i < mods.size() && i < 5; ++i) {
+                      SDL_Rect mr = {680, (int)(140 + i * 75), 520, 65};
+                      std::string mTxt = "Mod [" + mods[i].first + "]: " + (mods[i].second ? "ON" : "OFF");
+                      drawBox(mr, mTxt.c_str(), mods[i].second, false);
+                  }
+                  if (mods.empty()) {
+                      SDL_Rect em = {680, 140, 520, 65};
+                      drawBox(em, "Mods Folder: /switch/vcmi/Mods", false, false);
+                  }
+
+                  drawBox(btnPlay, "TAP HERE (OR PRESS A / +) TO START HEROES III", true, true);
+                  SDL_RenderPresent(ren);
+              }
+
+              makeDir("sdmc:/switch");
+              makeDir("sdmc:/switch/vcmi");
+              makeDir("sdmc:/switch/vcmi/config");
+
+              std::ofstream cfg("sdmc:/switch/vcmi/config/settings.json");
+              cfg << "{\n"
+                  << "  \"input\": {\n"
+                  << "    \"enableTouch\": " << (enableTouch ? "true" : "false") << ",\n"
+                  << "    \"enableController\": true,\n"
+                  << "    \"radialWheel\": " << (radialWheel ? "true" : "false") << "\n"
+                  << "  },\n"
+                  << "  \"video\": {\n"
+                  << "    \"screenRes\": { \"width\": 1280, \"height\": 720, \"scaling\": " << uiScale << " },\n"
+                  << "    \"fullscreen\": true\n"
+                  << "  }\n"
+                  << "}\n";
+              cfg.close();
+
+              if (font) TTF_CloseFont(font);
+              TTF_Quit();
+              SDL_DestroyRenderer(ren);
+              SDL_DestroyWindow(win);
+              SDL_Quit();
+              plExit();
+              romfsExit();
+
+              envSetNextLoad("sdmc:/switch/vcmi/vcmiclient.nro", "sdmc:/switch/vcmi/vcmiclient.nro");
+              socketExit();
+              return 0;
+          }
+          EOF
+
+      - name: 3. Compile Switch .NRO File
+        run: |
+          export DEVKITPRO=/opt/devkitpro
+          export PATH="$DEVKITPRO/tools/bin:$DEVKITPRO/devkitA64/bin:$PATH"
+          /opt/devkitpro/devkitA64/bin/aarch64-none-elf-g++ switch_launcher_main.cpp \
+            -O2 -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE \
+            -I/opt/devkitpro/portlibs/switch/include \
+            -I/opt/devkitpro/libnx/include \
+            -L/opt/devkitpro/portlibs/switch/lib \
+            -L/opt/devkitpro/libnx/lib \
+            -lSDL2_ttf -lSDL2 -lfreetype -lharfbuzz -lpng16 -lbz2 -lz \
+            -lglad -lEGL -lglapi -ldrm_nouveau -lnx -lm -specs=/opt/devkitpro/libnx/switch.specs \
+            -o VCMI_Launcher.elf
+          /opt/devkitpro/tools/bin/nacptool --create "VCMI Touch Launcher" "VCMI Switch" "1.7.5" VCMI_Launcher.nacp
+          /opt/devkitpro/tools/bin/elf2nro VCMI_Launcher.elf VCMI_Launcher.nro --nacp=VCMI_Launcher.nacp
+
+      - name: 4. Upload Ready-to-Play Switch NRO
+        uses: actions/upload-artifact@v4
+        with:
+          name: VCMI-Switch-Touch-Launcher
+          path: VCMI_Launcher.nro
 
